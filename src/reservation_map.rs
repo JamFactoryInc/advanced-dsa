@@ -412,12 +412,14 @@ struct ResourceLane {
 }
 impl ResourceLane {
     pub fn new(width: ResourceRequirement) -> Self {
-        let mut vacancies = BTreeSet::new();
         // start with a single vacancy encompassing the entire timeline
-        vacancies.insert(Vacancy::new(
-            Allocation::new(0, width.width),
-            Duration::new_unbounded(Step(0))
-        ));
+        let vacancies = BTreeSet::from([
+            Vacancy::new(
+                Allocation::new(0, width.width),
+                Duration::new_unbounded(Step(0))
+            )
+        ]);
+        
         ResourceLane {
             vacancies: vec![vacancies],
             reservations: Vec::new(),
@@ -461,7 +463,11 @@ impl ResourceLane {
 
                 if vertical_margin.width() >= reservation_request.width() {
                     // println!("Tracking vertical margin: {:?}", vertical_margin);
-                    self.track_vacancy(vertical_margin);
+                    if vertical_margin.duration.is_unbounded() {
+                        self.vacancies.push(BTreeSet::from([vertical_margin]))
+                    } else {
+                        self.track_vacancy(vertical_margin);
+                    }
                 } else {
                     // println!("Deferring vertical margin: {:?}", vertical_margin);
                     self.next_pass_vacancies.push(vertical_margin);
@@ -469,7 +475,43 @@ impl ResourceLane {
             }
             Some(allocation)
         } else {
-            None
+            let allocated_vacancy = self.allocate_new_vacancy(reservation_request.resource_requirement);
+            let allocation = allocated_vacancy.get_allocation_for(&reservation_request);
+            let (left, right, vertical) = allocated_vacancy.get_margin_around(&reservation_request)
+                .expect("Unbounded vacancy that cannot contain the reservation request");
+            
+            let mut set = BTreeSet::new();
+            let mut cursor = unsafe {
+                set.upper_bound_mut(Included(&allocated_vacancy))
+            };
+
+            let mut inserted = false;
+            if left.is_non_empty() {
+                cursor.insert_before(left).expect("Failed to insert left margin");
+                inserted = true;
+            }
+            if right.is_non_empty() {
+                cursor.insert_after(right).expect("Failed to insert right margin");
+                inserted = true;
+            }
+            
+            if vertical.is_non_empty() {
+                if vertical.width() >= reservation_request.width() {
+                    if !inserted {
+                        cursor.insert_after(vertical).expect("Failed to insert vertical margin");
+                    } else {
+                        self.vacancies.push(BTreeSet::from([vertical]))
+                    }
+                } else {
+                    if !inserted {
+                        cursor.insert_after(vertical).expect("Failed to insert vertical margin");
+                    } else {
+                        self.next_pass_vacancies.push(vertical);
+                    }
+                }
+            }
+            
+            Some(allocation)
         }
     }
 
@@ -493,22 +535,15 @@ impl ResourceLane {
         self.reservations.sort()
     }
     
-    // fn allocate_new_vacancy(&mut self, resource_requirement: ResourceRequirement) {
-    //     // create a new vacancy that encompasses the entire timeline
-    //     let new_vacancy = Vacancy::new(
-    //         Allocation::new(0, resource_requirement.width).offset_by(self.width),
-    //         Duration::new_unbounded(Step(0))
-    //     );
-    //     // insert it into the first sequence of vacancies
-    //     if let Some(sequence) = self.vacancies.first_mut() {
-    //         sequence.insert(new_vacancy);
-    //     } else {
-    //         // if there are no sequences, create a new one
-    //         let mut new_sequence = BTreeSet::new();
-    //         new_sequence.insert(new_vacancy);
-    //         self.vacancies.push(new_sequence);
-    //     }
-    // }
+    fn allocate_new_vacancy(&mut self, resource_requirement: ResourceRequirement) -> Vacancy {
+        // create a new vacancy that encompasses the entire timeline
+        let new_vacancy = Vacancy::new(
+            Allocation::new(0, resource_requirement.width).offset_by(self.width),
+            Duration::new_unbounded(Step(0))
+        );
+        self.width += resource_requirement.width;
+        new_vacancy
+    }
 
     /// makes a vacancy available for reservation in this lane.
     ///
@@ -547,9 +582,9 @@ impl ResourceLane {
 
         if !tracked {
             // no sequence found, create a new one
-            let mut new_sequence = BTreeSet::new();
-            new_sequence.insert(vacancy);
-            self.vacancies.push(new_sequence);
+            self.vacancies.push(BTreeSet::from([
+                vacancy
+            ]));
         }
     }
 
