@@ -1,5 +1,6 @@
 #![feature(btree_cursors)]
 #![feature(new_range_api)]
+#![feature(allocator_api)]
 extern crate core;
 
 mod reservation_map;
