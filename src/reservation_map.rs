@@ -58,21 +58,7 @@ impl Hasher for SimpleHasher {
 type LaneId = u32;
 
 /// A resource requirement that specifies the width of a contiguous block of resources necessary for a reservation
-#[derive(Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-struct ResourceWidth {
-    width: u32,
-}
-impl Debug for ResourceWidth {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<-{}->", self.width)
-    }
-}
-impl ResourceWidth {
-    pub fn new(width: u32) -> Self {
-        ResourceWidth { width }
-    }
-}
-
+type ResourceWidth = u32;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct ResourceBlock {
@@ -128,6 +114,18 @@ impl Step {
         Step(step)
     }
 }
+impl Sub for Step {
+    type Output = Step;
+    fn sub(self, rhs: Self) -> Self::Output {
+        Step(self.0.sub(rhs.0))
+    }
+}
+impl Add for Step {
+    type Output = Step;
+    fn add(self, rhs: Self) -> Self::Output {
+        Step(self.0.add(rhs.0))
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct Duration {
@@ -171,6 +169,14 @@ impl Duration {
     pub fn can_contain(&self, other: &Duration) -> bool {
         self.start <= other.start && self.end >= other.end
     }
+    
+    pub fn starts_after(&self, other: &Duration) -> bool {
+        self.start > other.start
+    }
+
+    pub fn ends_before(&self, other: &Duration) -> bool {
+        self.end < other.end
+    }
 }
 impl PartialOrd for Duration {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -192,7 +198,7 @@ struct PreAllocation
 }
 impl PreAllocation {
     pub fn width(&self) -> u32 {
-        self.width.width
+        self.width
     }
     pub fn length(&self) -> u32 {
         self.duration.length()
@@ -200,7 +206,7 @@ impl PreAllocation {
 }
 impl Debug for PreAllocation {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{:?}: {:?}-{:?}]", self.width.width, self.duration.start.0, self.duration.end.0)
+        write!(f, "[{:?}: {:?}-{:?}]", self.width, self.duration.start.0, self.duration.end.0)
     }
 }
 impl PartialOrd for PreAllocation {
@@ -212,7 +218,7 @@ impl PartialOrd for PreAllocation {
 }
 impl Ord for PreAllocation {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.width.width.cmp(&self.width.width)
+        other.width.cmp(&self.width)
             .then_with(|| self.duration.start.cmp(&other.duration.start))
     }
 }
@@ -263,26 +269,28 @@ impl Ord for Allocation {
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 struct Vacancy {
+    /// represents the duration for which the associated resources are unused
     duration: Duration,
-    empty_block: ResourceBlock,
+    /// represents the vacant resources
+    block: ResourceBlock,
 }
 impl Vacancy {
     pub fn new(allocation: ResourceBlock, duration: Duration) -> Self {
         Vacancy {
             duration,
-            empty_block: allocation,
+            block: allocation,
         }
     }
 
     pub fn range(duration: Duration) -> Self {
         Vacancy {
             duration,
-            empty_block: ResourceBlock::new(0, 0),
+            block: ResourceBlock::new(0, 0),
         }
     }
 
     pub fn width(&self) -> u32 {
-        self.empty_block.width()
+        self.block.width()
     }
 
     pub fn can_contain(&self, other: &PreAllocation) -> bool {
@@ -295,11 +303,11 @@ impl Vacancy {
     ///
     /// otherwise, the vacancy should be discarded
     pub fn is_non_empty(&self) -> bool {
-        self.duration.is_nonzero() && self.empty_block.width() > 0
+        self.duration.is_nonzero() && self.block.width() > 0
     }
 
     pub fn get_allocation_for(&self, res_request: &PreAllocation) -> ResourceBlock {
-        let start = self.empty_block.start;
+        let start = self.block.start;
         let end = start + res_request.width();
         ResourceBlock::new(start, end)
     }
@@ -318,17 +326,17 @@ impl Vacancy {
 
         let left_margin = Vacancy {
             duration: left_duration,
-            empty_block: self.empty_block,
+            block: self.block,
         };
         let right_margin = Vacancy {
             duration: right_duration,
-            empty_block: self.empty_block,
+            block: self.block,
         };
         let vertical_margin = Vacancy {
             duration: self.duration,
-            empty_block: ResourceBlock::new(
-                self.empty_block.start.add(res_request.width()),
-                self.empty_block.end,
+            block: ResourceBlock::new(
+                self.block.start.add(res_request.width()),
+                self.block.end,
             ),
         };
 
@@ -366,57 +374,49 @@ impl<'a> VacanciesCursor<'a> {
         } else if removed.duration.end == self.bounding_box.end {
             self.bounding_box.end = removed.duration.start
         }
-        
+
         Some(removed)
+    }
+    
+    fn update_bounding_box_post_insert(&mut self, inserted_dur: &Duration) {
+        if self.bounding_box.starts_after(inserted_dur) {
+            self.bounding_box.start = inserted_dur.start
+        }
+        if self.bounding_box.ends_before(inserted_dur) {
+            self.bounding_box.end = inserted_dur.end
+        }
     }
 
     pub fn insert_before(&mut self, value: Vacancy) -> Result<(), UnorderedKeyError> {
-        self.cursor.insert_before(value)?;
-        
-        if self.bounding_box.start > value.duration.start {
-            self.bounding_box.start = value.duration.start
-        }
-        if self.bounding_box.end < value.duration.end {
-            self.bounding_box.end = value.duration.end
-        }
-        
-        Ok(())
+        self.cursor.insert_before(value)
+            .inspect(|_| self.update_bounding_box_post_insert(&value.duration))
     }
 
     pub fn insert_after(&mut self, value: Vacancy) -> Result<(), UnorderedKeyError> {
-        self.cursor.insert_after(value)?;
-
-        if self.bounding_box.start > value.duration.start {
-            self.bounding_box.start = value.duration.start
-        }
-        if self.bounding_box.end < value.duration.end {
-            self.bounding_box.end = value.duration.end
-        }
-
-        Ok(())
+        self.cursor.insert_after(value)
+            .inspect(|_| self.update_bounding_box_post_insert(&value.duration))
     }
 }
 
 #[derive(Debug)]
-struct Vacancies {
+struct VacancySequence {
     vacancies: BTreeSet<Vacancy>,
     // the min and max possible values of this vacancy sequence
-    step_bounding_box: Duration
+    duration_bounds: Duration
 }
-impl Vacancies {
+impl VacancySequence {
     pub fn new(vacancy: Vacancy) -> Self {
-        Vacancies {
+        VacancySequence {
             vacancies: BTreeSet::from([vacancy]),
-            step_bounding_box: vacancy.duration
+            duration_bounds: vacancy.duration
         }
-    } 
+    }
 
     pub fn upper_bound_mut(&mut self, bound: Bound<&Vacancy>) -> VacanciesCursor<'_> {
-        let Vacancies {
+        let VacancySequence {
             vacancies,
-            step_bounding_box
+            duration_bounds: step_bounding_box
         } = self;
-
 
         VacanciesCursor {
             cursor: unsafe { vacancies.upper_bound_mut(bound) },
@@ -428,40 +428,40 @@ impl Vacancies {
 /// A structure that tracks vacancies for a given resource width
 struct Resources {
     // a set of non-overlapping sequences of vacancies
-    sequences: Vec<Vacancies>,
-    reservations: Vec<Allocation>,
+    sequences: Vec<VacancySequence>,
+    allocations: Vec<Allocation>,
     next_pass_vacancies: Vec<Vacancy>,
     width: u32,
 }
 impl Resources {
     pub fn new(width: ResourceWidth) -> Self {
         // start with a single vacancy encompassing the entire timeline
-        let vacancies = Vacancies::new(Vacancy::new(
-            ResourceBlock::new(0, width.width),
+        let vacancies = VacancySequence::new(Vacancy::new(
+            ResourceBlock::new(0, width),
             Duration::new_unbounded(Step(0))
         ));
         
         Resources {
             sequences: vec![vacancies],
-            reservations: Vec::new(),
+            allocations: Vec::new(),
             next_pass_vacancies: Vec::new(),
-            width: width.width,
+            width,
         }
     }
 
     /// reserves the request, returning the allocation that was reserved
-    pub fn reserve_vacancy(&mut self, reservation_id: ReservationId, reservation_request: PreAllocation) -> ResourceBlock {
-        
+    pub fn reserve_vacancy(&mut self, reservation_request: PreAllocation) -> ResourceBlock {
+
         let allocated_vacancy = self.sequences.iter_mut()
             .find_map(|sequence| {
 
-                if !sequence.step_bounding_box.can_contain(&reservation_request.duration) {
+                if !sequence.duration_bounds.can_contain(&reservation_request.duration) {
                     return None;
                 }
-                
+
                 let mut found_spot =
                     sequence.upper_bound_mut(Included(&Vacancy::range(reservation_request.duration)));
-                
+
                 found_spot.peek_prev()
                     .filter(|vac| vac.can_contain(&reservation_request))
                     .map(|_| ())
@@ -481,22 +481,20 @@ impl Resources {
                         }
 
                         let alloc = reserved_vac.get_allocation_for(&reservation_request);
-                        // println!("Reserved allocation: {:?}", alloc);
                         (alloc, vertical)
                     })
             });
-        
-        
+
+
         if let Some((allocation, vertical_margin)) = allocated_vacancy {
-            // println!("Found vacancy to fit {reservation_id:?} {reservation_request:?}");
-            
+
             if vertical_margin.is_non_empty() {
 
                 if vertical_margin.width() >= reservation_request.width() {
-                    
+
                     // println!("Tracking vertical margin: {:?}", vertical_margin);
                     if vertical_margin.duration.is_unbounded() {
-                        self.sequences.push(Vacancies::new(vertical_margin))
+                        self.sequences.push(VacancySequence::new(vertical_margin))
                     } else {
                         self.track_vacancy(vertical_margin);
                     }
@@ -506,15 +504,15 @@ impl Resources {
                 }
             }
             allocation
-            
+
         } else {
-            // println!("Could not find vacancy to fit {reservation_id:?} {reservation_request:?}");
+            
             let allocated_vacancy = self.allocate_new_vacancy(reservation_request.width);
             let allocation = allocated_vacancy.get_allocation_for(&reservation_request);
             let (left, right, vertical) = allocated_vacancy.get_margin_around(&reservation_request)
                 .expect("Unbounded vacancy that cannot contain the reservation request");
 
-            let mut new_vacancies = Vacancies::new(right);
+            let mut new_vacancies = VacancySequence::new(right);
             let mut cursor = new_vacancies.upper_bound_mut(Included(&allocated_vacancy));
 
             let insert_left_margin = left.is_non_empty();
@@ -527,7 +525,7 @@ impl Resources {
                     if !insert_left_margin {
                         cursor.insert_after(vertical).expect("Failed to insert vertical margin");
                     } else {
-                        self.sequences.push(Vacancies::new(vertical))
+                        self.sequences.push(VacancySequence::new(vertical))
                     }
                 } else {
                     if !insert_left_margin {
@@ -540,7 +538,7 @@ impl Resources {
             self.sequences.push(new_vacancies);
 
             allocation
-            
+
         }
     }
 
@@ -552,10 +550,10 @@ impl Resources {
             if self.next_pass_vacancies.is_empty() {
             return;
         }
-        
+
             let mut next_pass_vacancies = std::mem::take(&mut self.next_pass_vacancies);
             next_pass_vacancies.retain(|vac| {
-                if vac.width() >= pass_req.width {
+                if vac.width() >= pass_req {
                     self.track_vacancy(*vac);
                     false
                 } else {
@@ -567,16 +565,16 @@ impl Resources {
     }
 
     pub fn finalize(&mut self) {
-        self.reservations.sort()
+        self.allocations.sort()
     }
     
     fn allocate_new_vacancy(&mut self, resource_requirement: ResourceWidth) -> Vacancy {
         // create a new vacancy that encompasses the entire timeline
         let new_vacancy = Vacancy::new(
-            ResourceBlock::new(0, resource_requirement.width).offset_by(self.width),
+            ResourceBlock::new(0, resource_requirement).offset_by(self.width),
             Duration::new_unbounded(Step(0))
         );
-        self.width += resource_requirement.width;
+        self.width += resource_requirement;
         new_vacancy
     }
 
@@ -593,11 +591,11 @@ impl Resources {
 
         let mut tracked = false;
         for sequence in self.sequences.iter_mut() {
-            if sequence.step_bounding_box.overlaps_with(&vacancy.duration) {
+            if sequence.duration_bounds.overlaps_with(&vacancy.duration) {
                 // don't bother with vacancy sequences whose bounding box overlaps with the vacancy to track
                 break;
             }
-            
+
             // find a vacancy that can contain the reservation
             let mut found_spot = sequence.upper_bound_mut(Included(&vacancy));
 
@@ -623,7 +621,7 @@ impl Resources {
 
         if !tracked {
             // no sequence found, create a new one
-            self.sequences.push(Vacancies::new(vacancy));
+            self.sequences.push(VacancySequence::new(vacancy));
         }
     }
 
@@ -633,8 +631,8 @@ impl Resources {
     fn reserve(&mut self, reservation_id: ReservationId, req: &PreAllocation) {
         // find a vacancy that can contain the reservation, and reserve it
         // also tracks the resulting margins
-        let allocation = self.reserve_vacancy(reservation_id, *req);
-        self.reservations.push(
+        let allocation = self.reserve_vacancy(*req);
+        self.allocations.push(
             Allocation::new(
                 reservation_id,
                 *req,
@@ -645,7 +643,7 @@ impl Resources {
 }
 impl Debug for Resources {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut max_lane = self.reservations.iter()
+        let mut max_lane = self.allocations.iter()
             .map(|alloc| alloc.block.end)
             .max()
             .unwrap_or(0) - 1;
@@ -658,7 +656,7 @@ impl Debug for Resources {
             write!(f, "\n#{lane:<2}: ")?;
             let mut end_of_prev = 0;
 
-            for res in &self.reservations {
+            for res in &self.allocations {
                 if res.block.start <= lane && res.block.end > lane {
                     // println!("{res:?} dur start: {}, end of prev: {}", res.duration.start.0, end_of_prev);
                     let gap_len = res.duration.start.0 - end_of_prev;
@@ -745,7 +743,7 @@ impl ReservationBuilder {
                 }
             })
             else { return Err("reservation was bounded") };
-        
+
         self.requests.entry(width)
             .or_default()
             .push(sequence);
@@ -761,13 +759,13 @@ impl ReservationBuilder {
                 .expect("sequence must have a value");
             panic!("Reservation end is not set: {:?}", res);
         }
-        
+
         let mut requests = self.requests.iter().collect::<Vec<_>>();
-        
+
         // sort lanes from widest to narrowest resource width
         // similar to a coin change problem, we can ensure that the optimal packing is achieved if the largest items are packed first
         requests.sort_by(|(width_l, _), (width_r, _)| width_r.cmp(width_l));
-        
+
         // for (width, lane) in &requests {
         //     println!("{width:?}: {lane:?}")
         // }
@@ -778,14 +776,14 @@ impl ReservationBuilder {
         let mut resource_lanes = Resources::new(**width);
         for (width, lanes) in requests {
             resource_lanes.next_pass(*width);
-            
+
             lanes.iter().flatten().for_each(|reservation| {
                 resource_lanes.reserve(reservation.id, &reservation.request)
             })
         }
 
         resource_lanes.finalize();
-        
+
         Some(resource_lanes)
     }
 }
@@ -794,14 +792,14 @@ impl ReservationBuilder {
 fn test_build_reservations() {
     let mut builder = ReservationBuilder::new();
 
-    let _3 = builder.reserve(ResourceWidth::new(8));
+    let _3 = builder.reserve(8);
 
-    let _1 = builder.reserve(ResourceWidth::new(8));
+    let _1 = builder.reserve(8);
     builder.free(_1).unwrap();
 
-    let _2 = builder.reserve(ResourceWidth::new(4));
-    let _21 = builder.reserve(ResourceWidth::new(2));
-    let _22 = builder.reserve(ResourceWidth::new(2));
+    let _2 = builder.reserve(4);
+    let _21 = builder.reserve(2);
+    let _22 = builder.reserve(2);
     builder.free(_2).unwrap();
     builder.free(_21).unwrap();
     builder.free(_22).unwrap();
@@ -814,6 +812,34 @@ fn test_build_reservations() {
 }
 
 #[test]
+fn test_large_reservation_map() {
+    let mut _1 = Vec::with_capacity(10);
+    let mut _2 = Vec::with_capacity(10);
+
+    let mut builder = ReservationBuilder::new();
+
+    for i in 1..3 {
+
+        _1.push(builder.reserve(i));
+
+        for j in 1..3 {
+            _2.push(builder.reserve(j));
+        }
+
+        for id in _2.drain(..) {
+            builder.free(id).unwrap();
+        }
+    }
+
+    for id in _1.drain(..) {
+        builder.free(id).unwrap();
+    }
+
+    let resources = builder.build().unwrap();
+    println!("Resources: {resources:?}");
+}
+
+#[test]
 fn bench_tree_append_largest() {
     let mut sum = 0;
     for _ in 0..10 {
@@ -822,17 +848,17 @@ fn bench_tree_append_largest() {
         let mut values = (1..500).collect::<Vec<_>>();
         values.shuffle(&mut rand::rng());
 
-        
+
         for i in &values {
             tree.insert(*i);
         }
-        
+
         timed! {
             for i in &values {
                 sum += tree.upper_bound(Bound::Included(i)).peek_prev().unwrap_or(&0);
             }
         }
-        
+
         println!("Last: {:?}", tree.last())
     }
     println!("Sum: {sum}")
@@ -844,23 +870,23 @@ fn bench_reservation_map() {
     let mut _2 = Vec::with_capacity(10);
 
     for _ in 0..1 {
-        
+
         let mut builder = ReservationBuilder::new();
 
         timed! {
             for i in 1..150 {
-    
-                _1.push(builder.reserve(ResourceWidth::new(i)));
-    
+
+                _1.push(builder.reserve(i));
+
                 for j in 1..10 {
-                    _2.push(builder.reserve(ResourceWidth::new(j)));
+                    _2.push(builder.reserve(j));
                 }
-    
+
                 for id in _2.drain(..) {
                     builder.free(id).unwrap();
                 }
             }
-    
+
             for id in _1.drain(..) {
                 builder.free(id).unwrap();
             }
