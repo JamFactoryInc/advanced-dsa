@@ -7,6 +7,7 @@ use std::fmt::{Debug, Formatter};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::ops::Bound::Included;
 use std::ops::{Add, Deref, Div, Sub};
+use std::slice::Iter;
 use std::time::SystemTime;
 use rand::prelude::SliceRandom;
 
@@ -169,7 +170,7 @@ impl Duration {
     pub fn can_contain(&self, other: &Duration) -> bool {
         self.start <= other.start && self.end >= other.end
     }
-    
+
     pub fn starts_after(&self, other: &Duration) -> bool {
         self.start > other.start
     }
@@ -224,7 +225,7 @@ impl Ord for PreAllocation {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-struct ReservationId(usize);
+struct ReservationId(u32);
 impl Debug for ReservationId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "${:?}", self.0)
@@ -232,7 +233,7 @@ impl Debug for ReservationId {
 }
 impl Hash for ReservationId {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_usize(self.0);
+        state.write_u32(self.0);
     }
 }
 
@@ -367,6 +368,10 @@ impl<'a> VacanciesCursor<'a> {
         self.cursor.peek_next()
     }
 
+    pub fn next(&mut self) -> Option<&Vacancy> {
+        self.cursor.next()
+    }
+
     pub fn remove_prev(&mut self) -> Option<Vacancy> {
         let removed = self.cursor.remove_prev()?;
         if removed.duration.start == self.bounding_box.start {
@@ -377,7 +382,7 @@ impl<'a> VacanciesCursor<'a> {
 
         Some(removed)
     }
-    
+
     fn update_bounding_box_post_insert(&mut self, inserted_dur: &Duration) {
         if self.bounding_box.starts_after(inserted_dur) {
             self.bounding_box.start = inserted_dur.start
@@ -450,95 +455,106 @@ impl Resources {
     }
 
     /// reserves the request, returning the allocation that was reserved
-    pub fn reserve_vacancy(&mut self, reservation_request: PreAllocation) -> ResourceBlock {
+    pub fn reserve_vacancies_non_overlapping(&mut self, non_overlapping: &[ReservationData]) {
 
-        let allocated_vacancy = self.sequences.iter_mut()
-            .find_map(|sequence| {
+        let iter = non_overlapping.iter();
 
-                if !sequence.duration_bounds.can_contain(&reservation_request.duration) {
-                    return None;
-                }
+        for data in non_overlapping {
+            let res_id = data.id;
+            let reservation_request = data.request;
+            let allocated_vacancy = self.sequences.iter_mut()
+                .find_map(|sequence| {
 
-                let mut found_spot =
-                    sequence.upper_bound_mut(Included(&Vacancy::range(reservation_request.duration)));
+                    if !sequence.duration_bounds.can_contain(&reservation_request.duration) {
+                        return None;
+                    }
 
-                found_spot.peek_prev()
-                    .filter(|vac| vac.can_contain(&reservation_request))
-                    .map(|_| ())
-                    .and_then(|_| {
-                        found_spot.remove_prev()
-                    })
-                    .map(|reserved_vac| {
-                        // println!("\nReserving vacancy: {:?} for req {:?}", reserved_vac, reservation_request);
-                        let (left, right, vertical) = reserved_vac.get_margin_around(&reservation_request)
-                            .expect("Found vacancy that cannot contain the reservation request");
-                        // println!("Left: {:?}, Right: {:?}, Vertical: {:?}", left, right, vertical);
-                        if left.is_non_empty() {
-                            found_spot.insert_before(left).expect("Failed to insert left margin");
+                    let mut found_spot =
+                        sequence.upper_bound_mut(Included(&Vacancy::range(reservation_request.duration)));
+
+                    found_spot.peek_prev()
+                        .filter(|vac| vac.can_contain(&reservation_request))
+                        .map(|_| ())
+                        .and_then(|_| {
+                            found_spot.remove_prev()
+                        })
+                        .map(|reserved_vac| {
+                            let (left, right, vertical) = reserved_vac.get_margin_around(&reservation_request)
+                                .expect("Found vacancy that cannot contain the reservation request");
+                            if left.is_non_empty() {
+                                found_spot.insert_before(left).expect("Failed to insert left margin");
+                            }
+                            if right.is_non_empty() {
+                                found_spot.insert_after(right).expect("Failed to insert right margin");
+                            }
+
+                            let alloc = reserved_vac.get_allocation_for(&reservation_request);
+                            (alloc, vertical)
+                        })
+                });
+
+            let allocation = if let Some((allocation, vertical_margin)) = allocated_vacancy {
+
+                if vertical_margin.is_non_empty() {
+
+                    if vertical_margin.width() >= reservation_request.width() {
+
+                        // println!("Tracking vertical margin: {:?}", vertical_margin);
+                        if vertical_margin.duration.is_unbounded() {
+                            self.sequences.push(VacancySequence::new(vertical_margin))
+                        } else {
+                            self.track_vacancy(vertical_margin);
                         }
-                        if right.is_non_empty() {
-                            found_spot.insert_after(right).expect("Failed to insert right margin");
+                    } else {
+                        // println!("Deferring vertical margin: {:?}", vertical_margin);
+                        self.next_pass_vacancies.push(vertical_margin);
+                    }
+                }
+                allocation
+
+            } else {
+
+                let allocated_vacancy = self.allocate_new_vacancy(reservation_request.width);
+                let allocation = allocated_vacancy.get_allocation_for(&reservation_request);
+                let (left, right, vertical) = allocated_vacancy.get_margin_around(&reservation_request)
+                    .expect("Unbounded vacancy that cannot contain the reservation request");
+
+                let mut new_vacancies = VacancySequence::new(right);
+                let mut cursor = new_vacancies.upper_bound_mut(Included(&allocated_vacancy));
+
+                let insert_left_margin = left.is_non_empty();
+                if insert_left_margin {
+                    cursor.insert_before(left).expect("Failed to insert left margin");
+                }
+
+                if vertical.is_non_empty() {
+                    if vertical.width() >= reservation_request.width() {
+                        if !insert_left_margin {
+                            cursor.insert_after(vertical).expect("Failed to insert vertical margin");
+                        } else {
+                            self.sequences.push(VacancySequence::new(vertical))
                         }
-
-                        let alloc = reserved_vac.get_allocation_for(&reservation_request);
-                        (alloc, vertical)
-                    })
-            });
-
-
-        if let Some((allocation, vertical_margin)) = allocated_vacancy {
-
-            if vertical_margin.is_non_empty() {
-
-                if vertical_margin.width() >= reservation_request.width() {
-
-                    // println!("Tracking vertical margin: {:?}", vertical_margin);
-                    if vertical_margin.duration.is_unbounded() {
-                        self.sequences.push(VacancySequence::new(vertical_margin))
                     } else {
-                        self.track_vacancy(vertical_margin);
-                    }
-                } else {
-                    // println!("Deferring vertical margin: {:?}", vertical_margin);
-                    self.next_pass_vacancies.push(vertical_margin);
-                }
-            }
-            allocation
-
-        } else {
-            
-            let allocated_vacancy = self.allocate_new_vacancy(reservation_request.width);
-            let allocation = allocated_vacancy.get_allocation_for(&reservation_request);
-            let (left, right, vertical) = allocated_vacancy.get_margin_around(&reservation_request)
-                .expect("Unbounded vacancy that cannot contain the reservation request");
-
-            let mut new_vacancies = VacancySequence::new(right);
-            let mut cursor = new_vacancies.upper_bound_mut(Included(&allocated_vacancy));
-
-            let insert_left_margin = left.is_non_empty();
-            if insert_left_margin {
-                cursor.insert_before(left).expect("Failed to insert left margin");
-            }
-
-            if vertical.is_non_empty() {
-                if vertical.width() >= reservation_request.width() {
-                    if !insert_left_margin {
-                        cursor.insert_after(vertical).expect("Failed to insert vertical margin");
-                    } else {
-                        self.sequences.push(VacancySequence::new(vertical))
-                    }
-                } else {
-                    if !insert_left_margin {
-                        cursor.insert_after(vertical).expect("Failed to insert vertical margin");
-                    } else {
-                        self.next_pass_vacancies.push(vertical);
+                        if !insert_left_margin {
+                            cursor.insert_after(vertical).expect("Failed to insert vertical margin");
+                        } else {
+                            self.next_pass_vacancies.push(vertical);
+                        }
                     }
                 }
-            }
-            self.sequences.push(new_vacancies);
+                self.sequences.push(new_vacancies);
 
-            allocation
+                allocation
 
+            };
+
+            self.allocations.push(
+                Allocation::new(
+                    res_id,
+                    reservation_request,
+                    allocation
+                )
+            );
         }
     }
 
@@ -628,17 +644,10 @@ impl Resources {
     /// Attempts to reserve the given reservation request in the lane
     ///
     /// If a vacancy is found that can accommodate the reservation, it will be reserved and split into multiple smaller vacancies making up the margins.
-    fn reserve(&mut self, reservation_id: ReservationId, req: &PreAllocation) {
+    fn reserve_non_overlapping(&mut self, non_overlapping: &[ReservationData]) {
         // find a vacancy that can contain the reservation, and reserve it
         // also tracks the resulting margins
-        let allocation = self.reserve_vacancy(*req);
-        self.allocations.push(
-            Allocation::new(
-                reservation_id,
-                *req,
-                allocation
-            )
-        );
+        self.reserve_vacancies_non_overlapping(non_overlapping);
     }
 }
 impl Debug for Resources {
@@ -687,7 +696,7 @@ struct ReservationBuilder {
     step: Step,
     checked_out: HashMap<ReservationId, (ResourceWidth, Vec<ReservationData>), SimpleHasher>,
     requests: HashMap<ResourceWidth, Vec<Vec<ReservationData>>, SimpleHasher>,
-    id_counter: usize
+    id_counter: u32
 }
 impl ReservationBuilder {
     pub fn new() -> Self {
@@ -776,10 +785,9 @@ impl ReservationBuilder {
         let mut resource_lanes = Resources::new(**width);
         for (width, lanes) in requests {
             resource_lanes.next_pass(*width);
-
-            lanes.iter().flatten().for_each(|reservation| {
-                resource_lanes.reserve(reservation.id, &reservation.request)
-            })
+            lanes.iter().for_each(|non_overlapping| {
+                resource_lanes.reserve_non_overlapping(non_overlapping.as_slice())
+            });
         }
 
         resource_lanes.finalize();
