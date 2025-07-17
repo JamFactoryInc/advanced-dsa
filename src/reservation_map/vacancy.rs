@@ -151,6 +151,19 @@ impl<'a> VacanciesCursor<'a> {
         self.cursor.insert_after(value)
             .inspect(|_| self.update_bounding_box_post_insert(&value.duration))
     }
+    
+    pub fn insert_margins(&mut self, margins: &(Vacancy, Vacancy, Vacancy)) {
+        let (left, right, vertical) = *margins;
+        if left.is_non_empty() {
+            self.insert_before(left).expect("Failed to insert left margin");
+        }
+        if vertical.is_non_empty() {
+            self.insert_before(vertical).expect("Failed to insert vertical margin");
+        }
+        if right.is_non_empty() {
+            self.insert_before(right).expect("Failed to insert right margin");
+        }
+    }
 }
 
 #[derive(Debug)]

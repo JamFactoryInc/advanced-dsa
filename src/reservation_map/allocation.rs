@@ -58,11 +58,11 @@ pub struct Allocation {
 }
 
 impl Allocation {
-    pub fn new(res_id: ReservationId, res_req: PreAllocation, allocation: ResourceBlock) -> Self {
+    pub fn new(res_id: &ReservationId, res_req: &PreAllocation, allocation: &ResourceBlock) -> Self {
         Allocation {
-            id: res_id,
+            id: *res_id,
             duration: res_req.duration,
-            block: allocation,
+            block: *allocation,
         }
     }
 }

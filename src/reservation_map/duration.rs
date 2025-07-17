@@ -54,7 +54,7 @@ impl Duration {
     }
 
     pub fn ends_before(&self, other: &Duration) -> bool {
-        self.end < other.end
+        self.end < other.start
     }
 }
 
