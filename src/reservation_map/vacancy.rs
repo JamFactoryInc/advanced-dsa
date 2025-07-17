@@ -1,5 +1,5 @@
 use std::assert_matches::{assert_matches, debug_assert_matches};
-use std::cmp::Ordering;
+use std::cmp::{Ordering};
 use std::ops::Add;
 use std::collections::btree_map::UnorderedKeyError;
 use std::collections::{BTreeSet, Bound};
@@ -120,34 +120,26 @@ impl<'a> VacanciesCursor<'a> {
     }
 
     pub fn remove_next(&mut self) -> Option<Vacancy> {
-        let removed = self.cursor.remove_next()?;
-        if removed.duration.start == self.bounding_box.start {
-            self.bounding_box.start = removed.duration.end
-        } else if removed.duration.end == self.bounding_box.end {
-            self.bounding_box.end = removed.duration.start
-        }
-
-        Some(removed)
+        self.cursor.remove_next()
+            .inspect(|value| self.update_bounding_box_post_remove(&value.duration))
     }
 
     pub fn remove_prev(&mut self) -> Option<Vacancy> {
-        let removed = self.cursor.remove_prev()?;
-        if removed.duration.start == self.bounding_box.start {
-            self.bounding_box.start = removed.duration.end
-        } else if removed.duration.end == self.bounding_box.end {
-            self.bounding_box.end = removed.duration.start
-        }
+        self.cursor.remove_prev()
+            .inspect(|value| self.update_bounding_box_post_remove(&value.duration))
+    }
 
-        Some(removed)
+    fn update_bounding_box_post_remove(&mut self, removed: &Duration) {
+        if removed.start == self.bounding_box.start {
+            self.bounding_box.start = removed.end
+        } else if removed.end == self.bounding_box.end {
+            self.bounding_box.end = removed.start
+        }
     }
 
     fn update_bounding_box_post_insert(&mut self, inserted_dur: &Duration) {
-        if self.bounding_box.starts_after(inserted_dur) {
-            self.bounding_box.start = inserted_dur.start
-        }
-        if self.bounding_box.ends_before(inserted_dur) {
-            self.bounding_box.end = inserted_dur.end
-        }
+        self.bounding_box.start = self.bounding_box.start.min(inserted_dur.start);
+        self.bounding_box.end = self.bounding_box.end.max(inserted_dur.end);
     }
 
     pub fn insert_before(&mut self, value: Vacancy) -> Result<(), UnorderedKeyError> {

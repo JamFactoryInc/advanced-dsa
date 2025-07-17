@@ -91,7 +91,6 @@ struct Resources {
     // a set of non-overlapping sequences of vacancies
     sequences: Vec<VacancySequence>,
     allocations: Vec<Allocation>,
-    next_pass_vacancies: Vec<Vacancy>,
     width: u32,
 }
 impl Resources {
@@ -105,7 +104,6 @@ impl Resources {
         Resources {
             sequences: vec![vacancies],
             allocations: Vec::new(),
-            next_pass_vacancies: Vec::new(),
             width,
         }
     }
@@ -268,28 +266,6 @@ impl Resources {
         }
     }
 
-    /// indicates that all subsequent accesses to this lane will have the given resource width or less
-    ///
-    /// this instructs the lane to make vacancies available that were not large enough to accommodate resources in the previous pass
-    pub fn next_pass(&mut self, pass_req: ResourceWidth) {
-        timed! {
-            if self.next_pass_vacancies.is_empty() {
-            return;
-        }
-
-            let mut next_pass_vacancies = std::mem::take(&mut self.next_pass_vacancies);
-            next_pass_vacancies.retain(|vac| {
-                if vac.width() >= pass_req {
-                    self.track_vacancy(*vac);
-                    false
-                } else {
-                    true
-                }
-            });
-            let _ = std::mem::replace(&mut self.next_pass_vacancies, next_pass_vacancies);
-        }
-    }
-
     pub fn finalize(&mut self) {
         self.allocations.sort()
     }
@@ -397,7 +373,7 @@ impl Debug for Resources {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct ReservationData {
     id: ReservationId,
     request: PreAllocation,
@@ -432,7 +408,7 @@ impl ReservationBuilder {
             width: req,
             duration: Duration::new_unbounded(self.step.get_and_increment()),
         };
-        self.check_out(ReservationData::new(id, request));
+        self.check_out(&ReservationData::new(id, request));
         id
     }
 
@@ -441,14 +417,14 @@ impl ReservationBuilder {
         self.un_check_out(id, end_step)
     }
 
-    fn check_out(&mut self, rsvn: ReservationData) {
+    fn check_out(&mut self, rsvn: &ReservationData) {
         let width = rsvn.request.width;
         let mut sequence = self.requests.get_mut(&width)
             .and_then(|lane| lane.pop())
             .unwrap_or_else(|| vec![]);
 
         let id = rsvn.id;
-        sequence.push(rsvn);
+        sequence.push(*rsvn);
         // println!("Inserting {id:?}");
         self.checked_out.insert(id, (width, sequence));
     }
@@ -486,7 +462,8 @@ impl ReservationBuilder {
             panic!("Reservation end is not set: {:?}", res);
         }
 
-        let mut requests = self.requests.iter().collect::<Vec<_>>();
+        let mut requests = self.requests.iter()
+            .collect::<Vec<_>>();
 
         // sort lanes from widest to narrowest resource width
         // similar to a coin change problem, we can ensure that the optimal packing is achieved if the largest items are packed first
@@ -500,8 +477,7 @@ impl ReservationBuilder {
             else { return None };
         // println!("Starting width: {width:?}");
         let mut resource_lanes = Resources::new(**width);
-        for (width, lanes) in requests {
-            resource_lanes.next_pass(*width);
+        for (_, lanes) in requests {
             lanes.iter().for_each(|non_overlapping| {
                 resource_lanes.reserve_non_overlapping(non_overlapping.as_slice())
             });
@@ -619,8 +595,8 @@ fn bench_tree_append_largest() {
 
 #[test]
 fn bench_reservation_map() {
-    let mut _1 = Vec::with_capacity(10);
-    let mut _2 = Vec::with_capacity(10);
+    let mut _1 = Vec::with_capacity(200);
+    let mut _2 = Vec::with_capacity(200);
 
     let mut x = 0u32;
     let mut sizes = iter::repeat_with(move || {
